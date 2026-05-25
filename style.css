@@ -227,6 +227,12 @@ h1 + p {
 	font-size: 0.9em;
 }
 
+.copy-back-error {
+	flex: 1 1 100%;
+	color: #a00;
+	font-size: 0.9em;
+}
+
 @media (max-width: 60ch) {
 	html {
 		font-size: 90%;

@@ -167,12 +167,47 @@ async function extractData(data) {
 	return undefined;
 }
 
+async function buildClipboardItemFromRenderData(render_data) {
+	const map = {};
+	const addBlob = async (type, value) => {
+		if (!type || map[type]) return;
+		if (typeof value === 'string') {
+			map[type] = new Blob([value], { type });
+		} else if (value && value.url) {
+			const resp = await fetch(value.url);
+			const blob = await resp.blob();
+			map[type] = blob.type
+				? blob
+				: new Blob([await blob.arrayBuffer()], { type });
+		}
+	};
+	if (render_data.types) {
+		for (const t of render_data.types) await addBlob(t.type, t.data);
+	}
+	if (render_data.items) {
+		for (const it of render_data.items) {
+			if (it.kind === 'string') {
+				await addBlob(it.type, it.as_string_or_file);
+			} else {
+				await addBlob(it.type, it.as_string_or_file);
+			}
+		}
+	}
+	if (render_data.files) {
+		for (const f of render_data.files) {
+			if (f && f.type) await addBlob(f.type, f);
+		}
+	}
+	return map;
+}
+
 function ClipboardInspector(props) {
-	const { data, label } = props;
+	const { data, label, fromShare } = props;
 	const [shareUrl, setShareUrl] = useState(null);
 	const [shareError, setShareError] = useState(null);
 	const [shareBusy, setShareBusy] = useState(false);
 	const [copied, setCopied] = useState(false);
+	const [copyBackStatus, setCopyBackStatus] = useState({});
 	const has_async_clipboard =
 		!navigator.clipboard || !navigator.clipboard.read;
 	const paste = useCallback(e => {
@@ -201,6 +236,96 @@ function ClipboardInspector(props) {
 			setShareBusy(false);
 		}
 	}, [data, label]);
+
+	const copyBackToClipboard = useCallback(async (render_data, idx) => {
+		setCopyBackStatus(s => ({ ...s, [idx]: { busy: true } }));
+		try {
+			const map = await buildClipboardItemFromRenderData(render_data);
+			const types = Object.keys(map);
+			if (!types.length) throw new Error('No data to copy');
+			if (
+				!navigator.clipboard ||
+				!navigator.clipboard.write ||
+				typeof ClipboardItem === 'undefined'
+			) {
+				const textType =
+					types.find(t => t === 'text/plain') ||
+					types.find(t => t.startsWith('text/'));
+				if (
+					textType &&
+					navigator.clipboard &&
+					navigator.clipboard.writeText
+				) {
+					await navigator.clipboard.writeText(
+						await map[textType].text()
+					);
+					setCopyBackStatus(s => ({
+						...s,
+						[idx]: { ok: `Copied as ${textType} (fallback)` }
+					}));
+					return;
+				}
+				throw new Error('Clipboard write API unavailable');
+			}
+			try {
+				await navigator.clipboard.write([new ClipboardItem(map)]);
+				setCopyBackStatus(s => ({
+					...s,
+					[idx]: { ok: `Copied ${types.length} type(s)` }
+				}));
+			} catch (err) {
+				// Some browsers restrict allowed MIME types. Retry with a
+				// reduced set (text/plain, text/html, image/png) before
+				// falling back to plain text only.
+				const safeTypes = types.filter(t =>
+					/^(text\/(plain|html)|image\/png)$/.test(t)
+				);
+				if (safeTypes.length && safeTypes.length < types.length) {
+					const safeMap = {};
+					for (const t of safeTypes) safeMap[t] = map[t];
+					try {
+						await navigator.clipboard.write([
+							new ClipboardItem(safeMap)
+						]);
+						setCopyBackStatus(s => ({
+							...s,
+							[idx]: {
+								ok: `Copied ${
+									safeTypes.length
+								} type(s) (browser rejected: ${types
+									.filter(t => !safeTypes.includes(t))
+									.join(', ')})`
+							}
+						}));
+						return;
+					} catch (_) {
+						/* fall through */
+					}
+				}
+				const textType =
+					types.find(t => t === 'text/plain') ||
+					types.find(t => t.startsWith('text/'));
+				if (textType) {
+					await navigator.clipboard.writeText(
+						await map[textType].text()
+					);
+					setCopyBackStatus(s => ({
+						...s,
+						[idx]: {
+							ok: `Copied as ${textType} (browser rejected richer types)`
+						}
+					}));
+					return;
+				}
+				throw err;
+			}
+		} catch (err) {
+			setCopyBackStatus(s => ({
+				...s,
+				[idx]: { error: String(err && err.message ? err.message : err) }
+			}));
+		}
+	}, []);
 
 	const copyShareUrl = useCallback(async () => {
 		if (!shareUrl) return;
@@ -299,6 +424,10 @@ function ClipboardInspector(props) {
 		);
 	}
 
+	const canWriteClipboard =
+		navigator.clipboard &&
+		(navigator.clipboard.write || navigator.clipboard.writeText);
+
 	return (
 		<div>
 			<div className="toolbar">
@@ -313,6 +442,45 @@ function ClipboardInspector(props) {
 				>
 					{shareBusy ? 'Encoding…' : '🔗 Share as URL'}
 				</button>
+				{fromShare &&
+					canWriteClipboard &&
+					data.map((render_data, idx) => {
+						const cbStatus = copyBackStatus[idx] || {};
+						const multi = data.length > 1;
+						return (
+							<button
+								key={idx}
+								type="button"
+								onClick={() =>
+									copyBackToClipboard(render_data, idx)
+								}
+								disabled={cbStatus.busy}
+								title="Write all available types back to your clipboard so you can paste them elsewhere"
+							>
+								{cbStatus.busy
+									? 'Copying…'
+									: cbStatus.ok
+									? `✓ ${
+											multi
+												? `Copied #${idx + 1}`
+												: 'Copied to clipboard'
+									  }`
+									: `📋 Copy${
+											multi ? ` #${idx + 1}` : ''
+									  } to clipboard`}
+							</button>
+						);
+					})}
+				{fromShare &&
+					data.map((render_data, idx) => {
+						const cbStatus = copyBackStatus[idx] || {};
+						if (!cbStatus.error) return null;
+						return (
+							<div className="copy-back-error" key={`err-${idx}`}>
+								✗ {cbStatus.error}
+							</div>
+						);
+					})}
 				{shareUrl && (
 					<div className="share-box">
 						<div className="share-row">
@@ -541,9 +709,13 @@ function ClipboardInspector(props) {
 
 var app_el = document.getElementById('app');
 
-function renderExtracted(extracted_data, label) {
+function renderExtracted(extracted_data, label, fromShare) {
 	ReactDOM.render(
-		<ClipboardInspector data={extracted_data} label={label} />,
+		<ClipboardInspector
+			data={extracted_data}
+			label={label}
+			fromShare={!!fromShare}
+		/>,
 		app_el
 	);
 }
@@ -554,7 +726,7 @@ async function render(data, label) {
 				(Array.isArray(data) ? data : [data]).map(extractData)
 		  )
 		: [];
-	renderExtracted(extracted_data, label);
+	renderExtracted(extracted_data, label, false);
 }
 
 async function bootstrap() {
@@ -562,7 +734,7 @@ async function bootstrap() {
 	if (m) {
 		try {
 			const payload = await decodeShare(m[1]);
-			renderExtracted(payload.data || [], payload.label);
+			renderExtracted(payload.data || [], payload.label, true);
 			return;
 		} catch (err) {
 			console.error('Failed to decode shared clipboard data:', err);
